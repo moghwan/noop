@@ -367,12 +367,19 @@ public final class BLEManager: NSObject, ObservableObject {
         log("→ \(command.label) payload=\(hex(payload))")
     }
 
-    /// Ask CoreBluetooth for the current Battery Level value when the standard profile is present.
-    /// WHOOP 5/MG exposes live battery through 0x2A19, while WHOOP 4 can also answer the legacy
-    /// proprietary command path.
+    /// Refresh the battery reading on demand. Source is FAMILY-SPECIFIC (#77): on a WHOOP 4.0 the
+    /// standard 0x2A19 characteristic is a STUB that reports a constant 100 — the real charge only
+    /// comes from the proprietary GET_BATTERY_LEVEL command (COMMAND_RESPONSE, u16/10). Reading both
+    /// flashed 100% before the true value corrected it (and a stub notification could revert a real
+    /// 94% back to 100%). So WHOOP 4 uses ONLY the command; WHOOP 5/MG uses ONLY 0x2A19.
     public func refreshBattery() {
         guard state.connected, let p = peripheral, p.state == .connected else {
             log("refreshBattery ignored — not connected")
+            return
+        }
+
+        if selectedModel.deviceFamily == .whoop4 {
+            send(.getBatteryLevel, payload: [0x00])
             return
         }
 
@@ -386,10 +393,6 @@ public final class BLEManager: NSObject, ObservableObject {
         } else {
             log("Battery Level characteristic unavailable")
         }
-
-        if selectedModel.deviceFamily == .whoop4 {
-            send(.getBatteryLevel, payload: [0x00])
-        }
     }
 
     /// Ack one HISTORY_END chunk so the strap may trim it. Confirmed write — the strap forgets
@@ -402,6 +405,10 @@ public final class BLEManager: NSObject, ObservableObject {
     /// the Backfiller; it is passed here only for logging.
     func ackHistoricalChunk(trim: UInt32, endData: [UInt8]) {
         send(.historicalDataResult, payload: [0x01] + endData, writeType: .withResponse)
+        // Progress signal for the "Syncing strap history…" UI (#77). Same main-queue delegate path as
+        // the other state mutations (e.g. lastSyncedAt in exitBackfilling). NOT historicalAckLogCounter
+        // — that's a puffin-write log throttle that never increments on WHOOP 4.
+        state.syncChunksThisSession += 1
     }
 
     // MARK: Backfill helpers
@@ -426,6 +433,8 @@ public final class BLEManager: NSObject, ObservableObject {
         // backfill starts, whereas bootstrapStore() can build the Backfiller before the family is known.
         backfiller.begin(family: selectedModel.deviceFamily)
         backfilling = true
+        state.backfilling = true
+        state.syncChunksThisSession = 0
         historicalAckLogCounter = 0
         // Payload MUST be [0x00], NOT empty: verified on-device that this strap serves type-47 only with
         // [0x00] (empty → 0 frames on a clean stable link with ~2k records pending); the Mac ground-truth
@@ -518,6 +527,7 @@ public final class BLEManager: NSObject, ObservableObject {
     private func exitBackfilling(reason: String) {
         guard backfilling else { return }
         backfilling = false
+        state.backfilling = false
         backfillTimeout?.cancel()
         backfillTimeout = nil
         backfillFrameQueue.removeAll()
@@ -840,9 +850,12 @@ extension BLEManager: CBCentralManagerDelegate {
         whoop5SessionStarted = false
         clockRequested = false
         connectHandshakeDone = false
-        // Reset backfill state so the next connect starts a fresh offload.
+        // Reset backfill state so the next connect starts a fresh offload (incl. the syncing pill —
+        // a dropped link mid-offload must not leave "Syncing strap history…" stuck on, #77).
         backfillStarted = false
         backfilling = false
+        state.backfilling = false
+        state.syncChunksThisSession = 0
         backfillTimeout?.cancel()
         backfillTimeout = nil
         backfillFrameQueue.removeAll()
@@ -1169,7 +1182,12 @@ extension BLEManager: CBPeripheralDelegate {
                 log("WHOOP 5/MG: live HR streaming — marking the link established (experimental).")
             }
         case BLEManager.batteryChar:
-            if let pct = bytes.first { state.setBattery(Double(pct)) } // 0x2A19 = percent
+            // 0x2A19 = percent — 5/MG ONLY. The WHOOP 4.0's 0x2A19 is a stub constant 100 (real value =
+            // GET_BATTERY_LEVEL response, u16/10) and it's subscribed, so an unsolicited stub
+            // notification was reverting the true reading back to 100% (#77).
+            if selectedModel.deviceFamily != .whoop4, let pct = bytes.first {
+                state.setBattery(Double(pct))
+            }
         case BLEManager.dataNotifyChar,
              BLEManager.cmdNotifyChar,
              BLEManager.eventNotifyChar:

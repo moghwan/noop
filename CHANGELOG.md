@@ -17,7 +17,31 @@ approximate; downloads are on the [Releases](https://github.com/NoopApp/noop/rel
 
 ---
 
-## 1.50 — Steadier Bluetooth on congested Android stacks (#77)
+## 1.51 — True battery %, a sync indicator, and HR on imported workouts (#77)
+
+- **Fixed: battery flashing 100% then correcting (or reverting to 100%).** The WHOOP 4.0 exposes the
+  standard Battery Level characteristic (0x2A19) but it's a **stub that always reports 100** — the real
+  charge only comes from the proprietary `GET_BATTERY_LEVEL` response (u16/10). NOOP read **both** into
+  the same display with no priority, so 0x2A19 landed first (100%) and the real value corrected it a
+  beat later — and since 0x2A19 is also *subscribed*, a stray stub notification could revert a true 94%
+  back to 100%. Battery now comes **only from the real source per family**: WHOOP 4 = the proprietary
+  command; 5.0/MG = 0x2A19 (unchanged — its proprietary command isn't framed). On macOS this also stops
+  the stub 100 polluting the low-battery alert hook. Mac + Android.
+- **New: "Syncing strap history…" indicator** (Mac + Android). While a historical offload runs, Today /
+  Sleep / Intelligence's empty states show a pulsing pill with a live **chunks-pulled count** (a count,
+  never a percent — total pending is unknowable from the protocol), so "No nights here yet" mid-sync
+  reads as in-progress rather than final. The Live pill shows **"Bonded · syncing"**. `LiveState` now
+  publishes `backfilling` + `syncChunksThisSession` (Android republishes every 10th chunk so the
+  foreground-service notification isn't re-posted at chunk rate); cleared on session end AND on
+  disconnect so the pill can't stick on.
+- **Fixed (Android): imported workouts showed no HR.** Health Connect `ExerciseSessionRecord`s carry no
+  summary HR, so the importer stored `avgHr/maxHr = null` and the Workouts list rendered "–" forever.
+  Two-part fix: (a) the **importer** now intersects each session's window with its `HeartRateRecord`
+  samples (targeted per-session reads, one bad session can't fail the import) and stores real avg/max;
+  (b) **display fallback** — Workouts/Today fill a null-HR imported session from the strap's own ~1 Hz
+  samples over the workout window (new indexed `hrWindowStats` aggregate; ≥60 samples required so strays
+  can't fabricate an average; display-only so a re-import can't be clobbered; capped per load). Demo
+  flavor unaffected (its seeded workouts always carry HR).
 
 - **Fixed (Android): sustained command-write congestion on slow GATT stacks.** A Pixel 7 on Android 16
   logged ~56 `writeCharacteristic busy` retries **and 6 hard `dropped after 6 retries`** in ten minutes

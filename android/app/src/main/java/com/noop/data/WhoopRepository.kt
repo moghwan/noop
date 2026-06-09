@@ -3,6 +3,7 @@ package com.noop.data
 import android.content.Context
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
+import kotlin.math.roundToInt
 
 /**
  * Decoded streams to persist in one transaction. Android mirror of the Swift `Streams`
@@ -135,6 +136,32 @@ class WhoopRepository(private val dao: WhoopDao) {
     /** Downsampled HR (mean bpm per [bucketSeconds]) for the strap, for the Today 24h trend chart. */
     suspend fun hrBuckets(deviceId: String, from: Long, to: Long, bucketSeconds: Long = 300L) =
         dao.hrBuckets(deviceId, from, to, bucketSeconds)
+
+    /**
+     * DISPLAY-ONLY: fill missing workout HR from the strap's own samples (#77). An imported session
+     * (Health Connect / Apple Health) stores avgHr = null, but if the strap was worn during that
+     * window its ~1 Hz samples are already in Room under the strap device id — so derive avg/max
+     * from them. Fills only rows whose avgHr is null (never mixes sources within a row), requires
+     * [minSamples] (~1 min of data) so a few stray samples can't fabricate an average, and caps the
+     * lookups so a huge history can't jank first paint. NEVER persisted — a re-import must not see
+     * UI-derived values (the workout PK upsert would wipe them anyway).
+     */
+    suspend fun fillWorkoutHrFromStrap(
+        rows: List<WorkoutRow>,
+        strapDeviceId: String = "my-whoop",
+        minSamples: Long = 60,
+        cap: Int = 300,
+    ): List<WorkoutRow> {
+        var budget = cap
+        return rows.map { row ->
+            if (row.avgHr != null || row.endTs <= row.startTs || budget <= 0) return@map row
+            budget -= 1
+            val stats = dao.hrWindowStats(strapDeviceId, row.startTs, row.endTs)
+            if (stats.n >= minSamples && stats.avg != null && stats.max != null) {
+                row.copy(avgHr = stats.avg.roundToInt(), maxHr = row.maxHr ?: stats.max)
+            } else row
+        }
+    }
 
     suspend fun rrIntervals(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
         dao.rrIntervals(deviceId, from, to, limit)

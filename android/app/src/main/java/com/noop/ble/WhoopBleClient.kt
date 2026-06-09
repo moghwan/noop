@@ -58,7 +58,8 @@ import java.util.concurrent.ConcurrentLinkedQueue
  *  - [heartRate]   most-recent plausible BPM (30..220) from the standard 0x2A37 profile OR the
  *                  custom REALTIME_DATA frame
  *  - [rr]          most-recent R-R intervals (ms); the standard profile is the reliable source
- *  - [batteryPct]  battery percent (0x2A19 = whole %, or BATTERY_LEVEL event = u16/10)
+ *  - [batteryPct]  battery percent — 5/MG: 0x2A19 whole %; WHOOP 4: GET_BATTERY_LEVEL response u16/10
+ *                  (the 4.0's 0x2A19 is a stub constant 100 and is ignored, #77)
  *  - [worn]        wrist-wear from WRIST_ON/WRIST_OFF events; defaults true (Swift parity) so
  *                  wear-gated features work before the first event lands
  *  - [lastEvent]   the most-recent strap EVENT string ("WRIST_ON(9)", "DOUBLE_TAP(14)", …)
@@ -88,6 +89,13 @@ data class LiveState(
      *  MG secure handshake that isn't supported yet — so the UI explains that honestly instead of
      *  showing the generic "charge it and put it on" checklist. */
     val whoop5Detected: Boolean = false,
+    /** True while a historical offload session is running, so screens can say "Syncing strap
+     *  history…" instead of presenting half-loaded data as final (#77). */
+    val backfilling: Boolean = false,
+    /** Chunks acked during the current offload session — an honest progress signal (total pending is
+     *  unknowable from the protocol, so no percent). Republished every ~10 chunks: the foreground
+     *  service re-posts its notification on EVERY LiveState emission, so per-chunk would spam it. */
+    val syncChunksThisSession: Int = 0,
 )
 
 /**
@@ -385,6 +393,9 @@ class WhoopBleClient(
     /** True while a historical offload is in progress (offload frames route to the Backfiller). */
     @Volatile
     private var backfilling = false
+    /** Chunks acked this offload session — feeds LiveState.syncChunksThisSession (throttled). Only
+     *  touched on the serial backfill drain coroutine + the begin/exit lifecycle. */
+    private var ackedChunksThisSession = 0
 
     /** Guards the once-per-connect initial offload kick (Swift `backfillStarted`). */
     private var backfillStarted = false
@@ -642,16 +653,22 @@ class WhoopBleClient(
     }
 
     /**
-     * Read the standard Battery Level characteristic (0x2A19) on demand for "Refresh battery".
-     * WHOOP 5/MG exposes live battery here, and its proprietary GET_BATTERY_LEVEL command is dropped by
-     * send() (only HR-toggle + buzz are framed for 5/MG) — so without this the manual refresh was a no-op
-     * on 5/MG. WHOOP 4 also answers the legacy command path, so it gets both. Mirrors macOS
-     * BLEManager.refreshBattery(). The read result arrives in onCharacteristicRead → onInbound → setBattery.
+     * Refresh the battery reading on demand ("Refresh battery", screen entry).
+     *
+     * Source is FAMILY-SPECIFIC (#77): on a WHOOP 4.0 the standard 0x2A19 characteristic is a STUB that
+     * reports a constant 100, while the real charge only comes from the proprietary GET_BATTERY_LEVEL
+     * command (COMMAND_RESPONSE, u16/10) — reading both flashed 100% before the true value corrected it.
+     * So WHOOP 4 uses ONLY the command; WHOOP 5/MG uses ONLY 0x2A19 (its proprietary command isn't framed
+     * — see send()). Mirrors macOS BLEManager.refreshBattery().
      */
     fun refreshBattery() {
         val g = gatt
         if (g == null) {
             log("refreshBattery ignored — not connected")
+            return
+        }
+        if (connectedFamily == DeviceFamily.WHOOP4) {
+            send(CommandNumber.GET_BATTERY_LEVEL)
             return
         }
         val batt = g.getService(BATTERY_SERVICE)?.getCharacteristic(BATTERY_CHAR)
@@ -661,7 +678,6 @@ class WhoopBleClient(
         } else {
             log("Battery Level read unavailable; relying on notifications")
         }
-        if (connectedFamily == DeviceFamily.WHOOP4) send(CommandNumber.GET_BATTERY_LEVEL)
     }
 
     /**
@@ -952,9 +968,12 @@ class WhoopBleClient(
         resubscribedSinceData = false               // data is flowing again — re-arm the one-shot resubscribe
         when {
             uuid == HEART_RATE_CHAR -> parseStandardHr(bytes)       // 0x2A37
-            uuid == BATTERY_CHAR -> bytes.firstOrNull()?.let {      // 0x2A19 = percent
-                setBattery((it.toInt() and 0xFF).toDouble())
-            }
+            // 0x2A19 = percent — 5/MG ONLY. On a WHOOP 4.0 this characteristic is a stub constant 100
+            // (the real value is the GET_BATTERY_LEVEL COMMAND_RESPONSE, u16/10), and it's also
+            // SUBSCRIBED, so an unsolicited stub notification could flip the display back to 100 (#77).
+            uuid == BATTERY_CHAR -> if (connectedFamily != DeviceFamily.WHOOP4) {
+                bytes.firstOrNull()?.let { setBattery((it.toInt() and 0xFF).toDouble()) }
+            } else Unit
             // WHOOP4 custom notify chars, OR the WHOOP 5/MG puffin notify chars (fd4b0003/4/5/7) once
             // bonded — both carry framed records (REALTIME_DATA etc.) through the family-aware reassembler.
             uuid == CMD_NOTIFY_CHAR || uuid == EVENT_NOTIFY_CHAR || uuid == DATA_NOTIFY_CHAR ||
@@ -1602,6 +1621,8 @@ class WhoopBleClient(
         if (backfilling) return
         backfiller.begin()
         backfilling = true
+        ackedChunksThisSession = 0
+        _state.value = _state.value.copy(backfilling = true, syncChunksThisSession = 0)
         send(CommandNumber.SEND_HISTORICAL_DATA, byteArrayOf(0), withResponse = true)
         armBackfillTimeout()
         log("Backfill: session started — historical offload requested")
@@ -1674,6 +1695,10 @@ class WhoopBleClient(
     private fun exitBackfilling(reason: String) {
         if (!backfilling) return
         backfilling = false
+        _state.value = _state.value.copy(
+            backfilling = false,
+            syncChunksThisSession = ackedChunksThisSession, // publish the final count
+        )
         handler.removeCallbacks(backfillTimeoutRunnable)
         backfillFrameQueue.clear()
         log("Backfill: session ended — reason=$reason")
@@ -1692,6 +1717,13 @@ class WhoopBleClient(
         payload[0] = 0x01
         System.arraycopy(endData, 0, payload, 1, endData.size)
         send(CommandNumber.HISTORICAL_DATA_RESULT, payload, withResponse = true)
+        // Progress signal for the "Syncing strap history…" UI (#77). Republish every 10th chunk only —
+        // the FGS notification re-posts on every LiveState emission. Runs on the single serial drain
+        // coroutine, so the counter is race-free.
+        ackedChunksThisSession += 1
+        if (ackedChunksThisSession % 10 == 0) {
+            _state.value = _state.value.copy(syncChunksThisSession = ackedChunksThisSession)
+        }
         log("Backfill: acked chunk trim=$trim")
     }
 
@@ -1705,8 +1737,12 @@ class WhoopBleClient(
         // flushStandardHR() calls in didDisconnectPeripheral). Runs on the IO scope.
         ioScope.launch { flushLive(); flushStandardHr() }
 
-        // Reset all per-connection state and clear UI flags.
-        _state.value = _state.value.copy(connected = false, bonded = false, encryptedBond = false)
+        // Reset all per-connection state and clear UI flags (incl. the syncing pill — a dropped link
+        // mid-offload must not leave "Syncing strap history…" stuck on, #77).
+        _state.value = _state.value.copy(
+            connected = false, bonded = false, encryptedBond = false,
+            backfilling = false, syncChunksThisSession = 0,
+        )
         reset()
 
         gatt?.close()

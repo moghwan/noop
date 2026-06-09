@@ -56,6 +56,15 @@ data class HrBucket(
     val avgBpm: Double,
 )
 
+/** Aggregate HR over a time window — sample count + avg/max bpm. Query result of
+ *  [WhoopDao.hrWindowStats], not a table. Used to derive a workout's HR from strap samples when
+ *  the imported session carries none (#77). avg/max are null when n == 0. */
+data class HrWindowStats(
+    val n: Long,
+    val avg: Double?,
+    val max: Int?,
+)
+
 /** R-R interval. Swift `rrInterval` (v1). PK (deviceId, ts, rrMs) — multiple R-R per ts. */
 @Entity(tableName = "rrInterval", primaryKeys = ["deviceId", "ts", "rrMs"])
 data class RrInterval(
